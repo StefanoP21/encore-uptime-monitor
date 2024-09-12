@@ -4,6 +4,7 @@ import { ping } from './ping';
 import { SQLDatabase } from 'encore.dev/storage/sqldb';
 import { Site } from '../site/site';
 import { CronJob } from 'encore.dev/cron';
+import { Topic } from 'encore.dev/pubsub';
 
 export const check = api(
   {
@@ -19,6 +20,14 @@ export const check = api(
 
 async function doCheck(site: Site): Promise<{ up: boolean }> {
   const { up } = await ping({ url: site.url });
+
+  // Publish a Pub/Sub message if the site transitions
+  // from up->down or from down->up. //
+  const wasUp = await getPreviousMeasurement(site.id);
+  if (up !== wasUp) {
+    await TransitionTopic.publish({ site, up });
+  }
+
   await MonitorDB.exec`
     INSERT INTO checks (site_id, up, checked_at) 
     VALUES (${site.id}, ${up}, NOW())
@@ -37,6 +46,26 @@ export const checkAll = api(
     await Promise.all(sites.sites.map(doCheck));
   }
 );
+
+export interface TransitionEvent {
+  site: Site;
+  up: boolean;
+}
+
+export const TransitionTopic = new Topic<TransitionEvent>('uptime-transition', {
+  deliveryGuarantee: 'at-least-once',
+});
+
+async function getPreviousMeasurement(siteID: number): Promise<boolean> {
+  const row = await MonitorDB.queryRow`
+    SELECT up
+    FROM checks
+    WHERE site_id = ${siteID}
+    ORDER BY checked_at DESC
+    LIMIT 1
+  `;
+  return row?.up ?? true;
+}
 
 const cronJob = new CronJob('check-all', {
   title: 'Check all sites',
